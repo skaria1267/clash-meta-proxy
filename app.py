@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-标准HTTP代理服务器 - 自动轮换节点
+标准HTTP代理服务器 - 自动轮换节点（修复YAML错误）
 """
 import os
 import base64
@@ -8,8 +8,7 @@ import yaml
 import time
 import subprocess
 import threading
-import socket
-import select
+import re
 from flask import Flask, request, Response, jsonify
 import requests
 
@@ -27,6 +26,22 @@ class RotatingProxyService:
         self.request_count = 0
         self.switch_interval = int(os.getenv("SWITCH_INTERVAL", "3"))
         
+    def fix_yaml_syntax(self, yaml_content):
+        """修复YAML语法错误"""
+        lines = yaml_content.split('\n')
+        fixed_lines = []
+        
+        for line in lines:
+            # 修复未闭合的GEOIP规则引号
+            if "- 'GEOIP,CN" in line and not line.rstrip().endswith("'"):
+                line = line.rstrip() + ",DIRECT'"
+            # 修复其他可能的引号问题
+            elif line.strip().startswith("- '") and line.count("'") % 2 != 0:
+                line = line.rstrip() + "'"
+            fixed_lines.append(line)
+        
+        return '\n'.join(fixed_lines)
+        
     def load_config(self):
         """加载Clash配置"""
         yaml_config = os.getenv("CLASH_YAML", "")
@@ -40,6 +55,9 @@ class RotatingProxyService:
         except:
             pass
         
+        # 修复YAML语法
+        yaml_config = self.fix_yaml_syntax(yaml_config)
+        
         try:
             self.config = yaml.safe_load(yaml_config)
             
@@ -49,8 +67,9 @@ class RotatingProxyService:
                 if not any(k in name for k in ['剩余流量', '距离下次', '套餐到期', '官网']):
                     self.nodes.append(proxy)
             
-            print(f"加载了 {len(self.nodes)} 个节点")
+            print(f"✅ 加载了 {len(self.nodes)} 个节点")
             
+            # 配置Clash
             self.config['mixed-port'] = self.clash_port
             self.config['allow-lan'] = True
             self.config['bind-address'] = '0.0.0.0'
@@ -87,7 +106,7 @@ class RotatingProxyService:
             )
             
             time.sleep(5)
-            print(f"Clash Meta启动成功 (端口: {self.clash_port})")
+            print(f"✅ Clash Meta启动成功 (端口: {self.clash_port})")
             self.switch_to_next_node()
             return True
         except Exception as e:
@@ -124,30 +143,23 @@ class RotatingProxyService:
 
 service = RotatingProxyService()
 
-# 处理标准HTTP代理请求
+# 处理代理请求
 @app.before_request
 def handle_proxy():
-    """拦截所有请求作为代理处理"""
+    """拦截代理请求"""
+    # API端点不拦截
+    if request.path in ['/', '/health', '/switch', '/nodes']:
+        return None
+    
     # 自动切换节点
     service.should_switch()
     
-    # 处理CONNECT方法（HTTPS隧道）
+    # 处理CONNECT
     if request.method == 'CONNECT':
-        return handle_connect()
+        return Response("HTTP/1.1 200 Connection Established\r\n\r\n", status=200)
     
-    # 处理普通HTTP请求
-    return handle_http_request()
-
-def handle_connect():
-    """处理CONNECT请求 - HTTPS隧道"""
-    return Response("HTTP/1.1 200 Connection Established\r\n\r\n", status=200)
-
-def handle_http_request():
-    """处理HTTP代理请求"""
-    # 获取完整URL
+    # 处理HTTP请求
     url = request.url
-    
-    # 如果是相对路径，构建完整URL
     if not url.startswith('http'):
         host = request.headers.get('Host')
         if host:
@@ -155,17 +167,12 @@ def handle_http_request():
             if request.query_string:
                 url += '?' + request.query_string.decode()
     
-    # 跳过健康检查和API端点
-    if request.path in ['/', '/health', '/switch', '/nodes']:
-        return None  # 让Flask继续处理
-    
-    # 准备请求头
+    # 准备请求
     headers = {}
     for key, value in request.headers:
         if key.lower() not in ['host', 'connection', 'proxy-connection']:
             headers[key] = value
     
-    # 通过Clash代理转发
     proxies = {
         'http': f'http://127.0.0.1:{service.clash_port}',
         'https': f'http://127.0.0.1:{service.clash_port}'
@@ -180,65 +187,51 @@ def handle_http_request():
             proxies=proxies,
             verify=False,
             allow_redirects=False,
-            timeout=30,
-            stream=True
+            timeout=30
         )
         
-        # 构建响应
-        response_headers = []
-        for key, value in resp.headers.items():
-            if key.lower() not in ['connection', 'transfer-encoding', 'content-encoding']:
-                response_headers.append((key, value))
-        
         return Response(
-            resp.iter_content(chunk_size=8192),
+            resp.content,
             status=resp.status_code,
-            headers=response_headers
+            headers=dict(resp.headers)
         )
         
     except Exception as e:
         print(f"代理错误: {e}")
-        service.switch_to_next_node()  # 出错时切换节点
-        return Response(f"Proxy Error: {e}", status=502)
+        service.switch_to_next_node()
+        return Response(f"Proxy Error", status=502)
 
 @app.route('/')
 def home():
     """主页"""
     return jsonify({
-        'service': '标准HTTP代理服务器',
-        'proxy_type': 'HTTP/HTTPS',
-        'proxy_port': os.getenv("PORT", 8080),
-        'total_nodes': len(service.nodes),
-        'current_node': service.current_node['name'] if service.current_node else None,
-        'switch_interval': f'每{service.switch_interval}个请求切换节点',
-        'usage': f'设置HTTP代理: http://{request.host}'
+        'service': '标准HTTP代理',
+        'type': 'HTTP/HTTPS Proxy',
+        'port': os.getenv("PORT", 8080),
+        'nodes': len(service.nodes),
+        'current': service.current_node['name'] if service.current_node else None,
+        'switch': f'每{service.switch_interval}个请求'
     })
 
 @app.route('/health')
 def health():
-    """健康检查"""
-    return jsonify({'status': 'healthy', 'nodes': len(service.nodes)})
+    return jsonify({'status': 'ok', 'nodes': len(service.nodes)})
 
 @app.route('/switch')
 def switch():
-    """手动切换节点"""
     node = service.switch_to_next_node()
     return jsonify({'switched_to': node})
 
 @app.route('/nodes')
 def nodes():
-    """查看所有节点"""
-    return jsonify({
-        'total': len(service.nodes),
-        'nodes': [n['name'] for n in service.nodes]
-    })
+    return jsonify({'total': len(service.nodes), 'nodes': [n['name'] for n in service.nodes]})
 
 if __name__ == '__main__':
     if service.load_config():
         if service.start_clash():
             print("="*50)
-            print("标准HTTP代理服务器就绪")
-            print(f"代理地址: http://0.0.0.0:{os.getenv('PORT', 8080)}")
+            print("🚀 标准HTTP代理服务器就绪")
+            print(f"📍 端口: {os.getenv('PORT', 8080)}")
             print("="*50)
     
     port = int(os.getenv("PORT", 8080))
